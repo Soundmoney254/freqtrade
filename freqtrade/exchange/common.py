@@ -65,6 +65,7 @@ SUPPORTED_EXCHANGES = [
 EXCHANGE_HAS_REQUIRED: Dict[str, List[str]] = {
     # Required / private
     "fetchOrder": ["fetchOpenOrder", "fetchClosedOrder"],
+    "fetchL2OrderBook": ["fetchTicker"],
     "cancelOrder": [],
     "createOrder": [],
     "fetchBalance": [],
@@ -92,6 +93,8 @@ EXCHANGE_HAS_OPTIONAL = [
     # 'fetchMarketLeverageTiers',  # Futures initialization
     # 'fetchOpenOrder', 'fetchClosedOrder',  # replacement for fetchOrder
     # 'fetchOpenOrders', 'fetchClosedOrders',  # 'fetchOrders',  # Refinding balance...
+    # ccxt.pro
+    "watchOHLCV",
 ]
 
 

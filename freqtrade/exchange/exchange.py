@@ -14,7 +14,7 @@ from threading import Lock
 from typing import Any, Coroutine, Dict, List, Literal, Optional, Tuple, Union
 
 import ccxt
-import ccxt.async_support as ccxt_async
+import ccxt.pro as ccxt_pro
 from cachetools import TTLCache
 from ccxt import TICK_SIZE
 from dateutil import parser
@@ -34,7 +34,15 @@ from freqtrade.constants import (
     PairWithTimeframe,
 )
 from freqtrade.data.converter import clean_ohlcv_dataframe, ohlcv_to_dataframe, trades_dict_to_list
-from freqtrade.enums import OPTIMIZE_MODES, CandleType, MarginMode, PriceType, RunMode, TradingMode
+from freqtrade.enums import (
+    OPTIMIZE_MODES,
+    TRADE_MODES,
+    CandleType,
+    MarginMode,
+    PriceType,
+    RunMode,
+    TradingMode,
+)
 from freqtrade.exceptions import (
     ConfigurationError,
     DDosProtection,
@@ -56,7 +64,6 @@ from freqtrade.exchange.exchange_utils import (
     ROUND,
     ROUND_DOWN,
     ROUND_UP,
-    CcxtModuleType,
     amount_to_contract_precision,
     amount_to_contracts,
     amount_to_precision,
@@ -73,6 +80,7 @@ from freqtrade.exchange.exchange_utils_timeframe import (
     timeframe_to_prev_date,
     timeframe_to_seconds,
 )
+from freqtrade.exchange.exchange_ws import ExchangeWS
 from freqtrade.exchange.types import OHLCVResponse, OrderBook, Ticker, Tickers
 from freqtrade.misc import (
     chunks,
@@ -83,7 +91,7 @@ from freqtrade.misc import (
 )
 from freqtrade.plugins.pairlist.pairlist_helpers import expand_pairlist
 from freqtrade.util import dt_from_ts, dt_now
-from freqtrade.util.datetime_helpers import dt_humanize_delta, dt_ts
+from freqtrade.util.datetime_helpers import dt_humanize_delta, dt_ts, format_ms_time
 from freqtrade.util.periodic_cache import PeriodicCache
 
 
@@ -117,6 +125,7 @@ class Exchange:
         "tickers_have_price": True,
         "trades_pagination": "time",  # Possible are "time" or "id"
         "trades_pagination_arg": "since",
+        "trades_has_history": False,
         "l2_limit_range": None,
         "l2_limit_range_required": True,  # Allow Empty L2 limit (kucoin)
         "mark_ohlcv_price": "mark",
@@ -129,6 +138,7 @@ class Exchange:
         "marketOrderRequiresPrice": False,
         "exchange_has_overrides": {},  # Dictionary overriding ccxt's "has".
         # Expected to be in the format {"fetchOHLCV": True} or {"fetchOHLCV": False}
+        "ws.enabled": False,  # Set to true for exchanges with tested websocket support
     }
     _ft_has: Dict = {}
     _ft_has_futures: Dict = {}
@@ -151,7 +161,9 @@ class Exchange:
         :return: None
         """
         self._api: ccxt.Exchange
-        self._api_async: ccxt_async.Exchange
+        self._api_async: ccxt_pro.Exchange
+        self._ws_async: ccxt_pro.Exchange = None
+        self._exchange_ws: Optional[ExchangeWS] = None
         self._markets: Dict = {}
         self._trading_fees: Dict[str, Any] = {}
         self._leverage_tiers: Dict[str, List[Dict]] = {}
@@ -218,7 +230,7 @@ class Exchange:
         ccxt_config = deep_merge_dicts(exchange_conf.get("ccxt_config", {}), ccxt_config)
         ccxt_config = deep_merge_dicts(exchange_conf.get("ccxt_sync_config", {}), ccxt_config)
 
-        self._api = self._init_ccxt(exchange_conf, ccxt_kwargs=ccxt_config)
+        self._api = self._init_ccxt(exchange_conf, True, ccxt_config)
 
         ccxt_async_config = self._ccxt_config
         ccxt_async_config = deep_merge_dicts(
@@ -227,7 +239,15 @@ class Exchange:
         ccxt_async_config = deep_merge_dicts(
             exchange_conf.get("ccxt_async_config", {}), ccxt_async_config
         )
-        self._api_async = self._init_ccxt(exchange_conf, ccxt_async, ccxt_kwargs=ccxt_async_config)
+        self._api_async = self._init_ccxt(exchange_conf, False, ccxt_async_config)
+        self._has_watch_ohlcv = self.exchange_has("watchOHLCV") and self._ft_has["ws.enabled"]
+        if (
+            self._config["runmode"] in TRADE_MODES
+            and exchange_conf.get("enable_ws", True)
+            and self._has_watch_ohlcv
+        ):
+            self._ws_async = self._init_ccxt(exchange_conf, False, ccxt_async_config)
+            self._exchange_ws = ExchangeWS(self._config, self._ws_async)
 
         logger.info(f'Using Exchange "{self.name}"')
         self.required_candle_call_count = 1
@@ -256,6 +276,8 @@ class Exchange:
         self.close()
 
     def close(self):
+        if self._exchange_ws:
+            self._exchange_ws.cleanup()
         logger.debug("Exchange object destroyed, closing async loop")
         if (
             getattr(self, "_api_async", None)
@@ -264,6 +286,14 @@ class Exchange:
         ):
             logger.debug("Closing async ccxt session.")
             self.loop.run_until_complete(self._api_async.close())
+        if (
+            self._ws_async
+            and inspect.iscoroutinefunction(self._ws_async.close)
+            and self._ws_async.session
+        ):
+            logger.debug("Closing ws ccxt session.")
+            self.loop.run_until_complete(self._ws_async.close())
+
         if self.loop and not self.loop.is_closed():
             self.loop.close()
 
@@ -287,27 +317,34 @@ class Exchange:
         self.validate_pricing(config["entry_pricing"])
 
     def _init_ccxt(
-        self,
-        exchange_config: Dict[str, Any],
-        ccxt_module: CcxtModuleType = ccxt,
-        *,
-        ccxt_kwargs: Dict,
+        self, exchange_config: Dict[str, Any], sync: bool, ccxt_kwargs: Dict[str, Any]
     ) -> ccxt.Exchange:
         """
-        Initialize ccxt with given config and return valid
-        ccxt instance.
+        Initialize ccxt with given config and return valid ccxt instance.
         """
         # Find matching class for the given exchange name
         name = exchange_config["name"]
+        if sync:
+            ccxt_module = ccxt
+        else:
+            ccxt_module = ccxt_pro
+            if not is_exchange_known_ccxt(name, ccxt_module):
+                # Fall back to async if pro doesn't support this exchange
+                import ccxt.async_support as ccxt_async
+
+                ccxt_module = ccxt_async
 
         if not is_exchange_known_ccxt(name, ccxt_module):
             raise OperationalException(f"Exchange {name} is not supported by ccxt")
 
         ex_config = {
-            "apiKey": exchange_config.get("key"),
+            "apiKey": exchange_config.get("apiKey", exchange_config.get("key")),
             "secret": exchange_config.get("secret"),
             "password": exchange_config.get("password"),
             "uid": exchange_config.get("uid", ""),
+            # DEX attributes:
+            "walletAddress": exchange_config.get("walletAddress"),
+            "privateKey": exchange_config.get("privateKey"),
         }
         if ccxt_kwargs:
             logger.info("Applying additional ccxt config: %s", ccxt_kwargs)
@@ -530,6 +567,13 @@ class Exchange:
             amount, self.get_precision_amount(pair), self.precisionMode, contract_size
         )
 
+    def ws_connection_reset(self):
+        """
+        called at regular intervals to reset the websocket connection
+        """
+        if self._exchange_ws:
+            self._exchange_ws.reset_connections()
+
     def _load_async_markets(self, reload: bool = False) -> Dict[str, Any]:
         try:
             markets = self.loop.run_until_complete(
@@ -561,6 +605,12 @@ class Exchange:
             # Reload async markets, then assign them to sync api
             self._markets = self._load_async_markets(reload=True)
             self._api.set_markets(self._api_async.markets, self._api_async.currencies)
+            # Assign options array, as it contains some temporary information from the exchange.
+            self._api.options = self._api_async.options
+            if self._exchange_ws:
+                # Set markets to avoid reloading on websocket api
+                self._ws_async.set_markets(self._api.markets, self._api.currencies)
+                self._ws_async.options = self._api.options
             self._last_markets_refresh = dt_ts()
 
             if is_initial and self._ft_has["needs_trading_fees"]:
@@ -794,7 +844,7 @@ class Exchange:
         """
         if endpoint in self._ft_has.get("exchange_has_overrides", {}):
             return self._ft_has["exchange_has_overrides"][endpoint]
-        return endpoint in self._api.has and self._api.has[endpoint]
+        return endpoint in self._api_async.has and self._api_async.has[endpoint]
 
     def get_precision_amount(self, pair: str) -> Optional[float]:
         """
@@ -2018,7 +2068,7 @@ class Exchange:
     def get_fee(
         self,
         symbol: str,
-        type: str = "",
+        order_type: str = "",
         side: str = "",
         amount: float = 1,
         price: float = 1,
@@ -2027,13 +2077,13 @@ class Exchange:
         """
         Retrieve fee from exchange
         :param symbol: Pair
-        :param type: Type of order (market, limit, ...)
+        :param order_type: Type of order (market, limit, ...)
         :param side: Side of order (buy, sell)
         :param amount: Amount of order
         :param price: Price of order
         :param taker_or_maker: 'maker' or 'taker' (ignored if "type" is provided)
         """
-        if type and type == "market":
+        if order_type and order_type == "market":
             taker_or_maker = "taker"
         try:
             if self._config["dry_run"] and self._config.get("fee", None) is not None:
@@ -2044,7 +2094,7 @@ class Exchange:
 
             return self._api.calculate_fee(
                 symbol=symbol,
-                type=type,
+                type=order_type,
                 side=side,
                 amount=amount,
                 price=price,
@@ -2227,9 +2277,40 @@ class Exchange:
         cache: bool,
     ) -> Coroutine[Any, Any, OHLCVResponse]:
         not_all_data = cache and self.required_candle_call_count > 1
+        if cache and candle_type in (CandleType.SPOT, CandleType.FUTURES):
+            if self._has_watch_ohlcv and self._exchange_ws:
+                # Subscribe to websocket
+                self._exchange_ws.schedule_ohlcv(pair, timeframe, candle_type)
+
         if cache and (pair, timeframe, candle_type) in self._klines:
             candle_limit = self.ohlcv_candle_limit(timeframe, candle_type)
-            min_date = date_minus_candles(timeframe, candle_limit - 5).timestamp()
+            min_date = int(date_minus_candles(timeframe, candle_limit - 5).timestamp())
+
+            if self._exchange_ws:
+                candle_date = int(timeframe_to_prev_date(timeframe).timestamp() * 1000)
+                prev_candle_date = int(date_minus_candles(timeframe, 1).timestamp() * 1000)
+                candles = self._exchange_ws.ccxt_object.ohlcvs.get(pair, {}).get(timeframe)
+                half_candle = int(candle_date - (candle_date - prev_candle_date) * 0.5)
+                last_refresh_time = int(
+                    self._exchange_ws.klines_last_refresh.get((pair, timeframe, candle_type), 0)
+                )
+
+                if (
+                    candles
+                    and candles[-1][0] >= prev_candle_date
+                    and last_refresh_time >= half_candle
+                ):
+                    # Usable result, candle contains the previous candle.
+                    # Also, we check if the last refresh time is no more than half the candle ago.
+                    logger.debug(f"reuse watch result for {pair}, {timeframe}, {last_refresh_time}")
+
+                    return self._exchange_ws.get_ohlcv(pair, timeframe, candle_type, candle_date)
+                logger.info(
+                    f"Failed to reuse watch {pair}, {timeframe}, {candle_date < last_refresh_time},"
+                    f" {candle_date}, {last_refresh_time}, "
+                    f"{format_ms_time(candle_date)}, {format_ms_time(last_refresh_time)} "
+                )
+
             # Check if 1 call can get us updated candles without hole in the data.
             if min_date < self._pairs_last_refresh_time.get((pair, timeframe, candle_type), 0):
                 # Cache can be used - do one-off call.
@@ -2262,7 +2343,7 @@ class Exchange:
 
     def _build_ohlcv_dl_jobs(
         self, pair_list: ListPairsWithTimeframes, since_ms: Optional[int], cache: bool
-    ) -> Tuple[List[Coroutine], List[Tuple[str, str, CandleType]]]:
+    ) -> Tuple[List[Coroutine], List[PairWithTimeframe]]:
         """
         Build Coroutines to execute as part of refresh_latest_ohlcv
         """
@@ -3343,8 +3424,7 @@ class Exchange:
         """
         Important: Must be fetching data from cached values as this is used by backtesting!
         :param pair: Market symbol
-        :param nominal_value: The total trade amount in quote currency including leverage
-        maintenance amount only on Binance
+        :param nominal_value: The total trade amount in quote currency
         :return: (maintenance margin ratio, maintenance amount)
         """
 
