@@ -32,7 +32,7 @@ def start_list_exchanges(args: Dict[str, Any]) -> None:
     )
 
     if args["print_one_column"]:
-        print("\n".join([e["name"] for e in available_exchanges]))
+        print("\n".join([e["classname"] for e in available_exchanges]))
     else:
         if args["list_exchanges_all"]:
             title = (
@@ -50,7 +50,7 @@ def start_list_exchanges(args: Dict[str, Any]) -> None:
         table.add_column("Reason")
 
         for exchange in available_exchanges:
-            name = Text(exchange["name"])
+            name = Text(exchange["classname"])
             if exchange["supported"]:
                 name.append(" (Official)", style="italic")
                 name.stylize("green bold")

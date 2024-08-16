@@ -243,6 +243,7 @@ def patch_exchange(
     mocker.patch(f"{EXMS}.id", PropertyMock(return_value=exchange))
     mocker.patch(f"{EXMS}.name", PropertyMock(return_value=exchange.title()))
     mocker.patch(f"{EXMS}.precisionMode", PropertyMock(return_value=2))
+    mocker.patch(f"{EXMS}.precision_mode_price", PropertyMock(return_value=2))
     # Temporary patch ...
     mocker.patch("freqtrade.exchange.bybit.Bybit.cache_leverage_tiers")
 
@@ -614,6 +615,7 @@ def get_default_conf(testdatadir):
         "internals": {},
         "export": "none",
         "dataformat_ohlcv": "feather",
+        "dataformat_trades": "feather",
         "runmode": "dry_run",
         "candle_type_def": CandleType.SPOT,
     }
@@ -2187,7 +2189,7 @@ def tickers():
                 "first": None,
                 "last": 530.21,
                 "change": 0.558,
-                "percentage": None,
+                "percentage": 2.349,
                 "average": None,
                 "baseVolume": 72300.0659,
                 "quoteVolume": 37670097.3022171,
