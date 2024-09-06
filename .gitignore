@@ -116,3 +116,4 @@ target/
 !config_examples/config_freqai.example.json
 
 docker-compose-*.yml
+ta-lib-0.4.0-src.tar.gz
